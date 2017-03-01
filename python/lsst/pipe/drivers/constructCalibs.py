@@ -23,6 +23,7 @@ from lsst.afw.cameraGeom.utils import makeImageFromCamera
 
 from lsst.ctrl.pool.parallel import BatchPoolTask
 from lsst.ctrl.pool.pool import Pool, NODE
+from lsst.pipe.drivers.background import SkyMeasurementTask, FocalPlaneBackground, FocalPlaneBackgroundConfig
 
 from .checksum import checksum
 from .utils import getDataRef
@@ -1020,3 +1021,462 @@ class FringeTask(CalibTask):
                 afwDet.setMaskFromFootprintList(
                     mask, fpSet.getFootprints(), detected)
         return exposure
+
+
+def pca(data, numComponents=None):
+    """Principal Components Analysis
+
+    From: http://stackoverflow.com/a/13224592/834250
+
+    @param data  numpy array of data to analyse
+    @param numComponents  number of principal components to use
+    @return principal components as numpy array, eigenvalues, eigenvectors
+    """
+    m, n = data.shape
+    data -= data.mean(axis=0)
+    R = np.cov(data, rowvar=False)
+    # use 'eigh' rather than 'eig' since R is symmetric,
+    # the performance gain is substantial
+    evals, evecs = np.linalg.eigh(R)
+    idx = np.argsort(evals)[::-1]
+    evecs = evecs[:,idx]
+    evals = evals[idx]
+    if numComponents is not None:
+        evecs = evecs[:, :numComponents]
+    # carry out the transformation on the data using eigenvectors
+    # and return the re-scaled data, eigenvalues, and eigenvectors
+    return np.dot(evecs.T, data.T).T, evals, evecs
+
+
+class RPCA(object):
+    """Robust PCA
+
+    Models data matrix D as L + S, where L is a low-rank matrix
+    (contains common elements) and S is a sparse matrix (contains
+    parts particular to individual elements).
+
+    Usage:
+
+    >>> L, S = RPCA(D).fit()
+
+    From https://github.com/dganguli/robust-pca/blob/master/r_pca.py
+    """
+    def __init__(self, D, mu=None, lmbda=None):
+        self.D = D
+        self.S = np.zeros(self.D.shape)
+        self.Y = np.zeros(self.D.shape)
+
+        if mu:
+            self.mu = mu
+        else:
+            self.mu = np.prod(self.D.shape) / (4 * self.norm_p(self.D, 2))
+
+        self.mu_inv = 1 / self.mu
+
+        if lmbda:
+            self.lmbda = lmbda
+        else:
+            self.lmbda = 1 / np.sqrt(np.max(self.D.shape))
+
+    @staticmethod
+    def norm_p(M, p):
+        return np.sum(np.power(M, p))
+
+    @staticmethod
+    def shrink(M, tau):
+        return np.sign(M) * np.maximum((np.abs(M) - tau), np.zeros(M.shape))
+
+    def svd_threshold(self, M, tau):
+        U, S, V = np.linalg.svd(M, full_matrices=False)
+        return np.dot(U, np.dot(np.diag(self.shrink(S, tau)), V))
+
+    def fit(self, tol=None, max_iter=1000, iter_print=100):
+        iteration = 0
+        err = np.Inf
+        Sk = self.S
+        Yk = self.Y
+        Lk = np.zeros(self.D.shape)
+
+        if tol:
+            _tol = tol
+        else:
+            _tol = 1E-9 * self.norm_p(np.abs(self.D), 2)
+
+        while (err > _tol) and iteration < max_iter:
+            Lk = self.svd_threshold(
+                self.D - Sk + self.mu_inv * Yk, self.mu_inv)
+            Sk = self.shrink(
+                self.D - Lk + (self.mu_inv * Yk), self.mu_inv * self.lmbda)
+            Yk = Yk + self.mu * (self.D - Lk - Sk)
+            err = self.norm_p(np.abs(self.D - Lk - Sk), 2)
+            iteration += 1
+
+        self.L = Lk
+        self.S = Sk
+        return Lk, Sk
+
+
+class BaseSkyConfig(CalibConfig):
+    """Base configuration for sky model construction"""
+    detection = ConfigurableField(target=measAlg.SourceDetectionTask, doc="Detection configuration")
+    detectSigma = Field(dtype=float, default=2.0, doc="Detection PSF gaussian sigma")
+    subtractBackground = ConfigurableField(target=measAlg.SubtractBackgroundTask,
+                                           doc="Background configuration")
+    sky = ConfigurableField(target=SkyMeasurementTask, doc="Sky measurement")
+    maskThresh = Field(dtype=float, default=3.0, doc="k-sigma threshold for masking pixels")
+    mask = ListField(dtype=str, default=["BAD", "SAT", "DETECTED", "NO_DATA"],
+                     doc="Mask planes to consider as contaminated")
+
+
+class BaseSkyTask(CalibTask):
+    """Task for sky model construction"""
+    ConfigClass = BaseSkyConfig
+
+    def __init__(self, *args, **kwargs):
+        CalibTask.__init__(self, *args, **kwargs)
+        self.makeSubtask("detection")
+        self.makeSubtask("subtractBackground")
+        self.makeSubtask("sky")
+
+    def _getConfigName(self):
+        return None
+    def _getMetadataName(self):
+        return None
+
+    def scatterProcess(self, pool, ccdIdLists):
+        """!Scatter the processing among the nodes
+
+        Only the master node executes this method, assigning work to the
+        slaves.
+
+        We subtract off a large-scale background model across all CCDs,
+        which requires a scatter/gather. Then we process the individual
+        CCDs, subtracting the large-scale background model and the
+        residual background model measured. These residuals will be
+        combined for the sky frame.
+
+        @param pool  Process pool
+        @param ccdIdLists  Dict of data identifier lists for each CCD name
+        @return Dict of lists of returned data for each CCD name
+        """
+        self.log.info("Scatter processing")
+
+        numExps = set(len(expList) for expList in ccdIdLists.values())
+        assert len(numExps) == 1
+        numExps = numExps.pop()
+
+        # First subtract off general gradients to make all the exposures look similar.
+        # We want to preserve the common small-scale structure, which we will coadd.
+        bgModelList = mapToMatrix(pool, self.measureBackground, ccdIdLists)
+
+        backgrounds = {}
+        scales = {}
+        for exp in range(numExps):
+            bgModels = [bgModelList[ccdName][exp] for ccdName in ccdIdLists]
+            visit = set(tuple(ccdIdLists[ccdName][exp][key] for key in sorted(self.config.visitKeys)) for
+                        ccdName in ccdIdLists)
+            assert len(visit) == 1
+            visit = visit.pop()
+            bgModel = bgModels[0]
+            for bg in bgModels[1:]:
+                bgModel.merge(bg)
+            backgrounds[visit] = bgModel
+            scales[visit] = np.median(bgModel.getStatsImage().getArray())
+
+        return mapToMatrix(pool, self.process, ccdIdLists, backgrounds=backgrounds, scales=scales)
+
+    def measureBackground(self, cache, dataId):
+        """!Measure background model for CCD
+
+        This method is executed by the slaves.
+
+        The background models for all CCDs in an exposure will be
+        combined to form a full focal-plane background model.
+
+        @param cache  Process pool cache
+        @param dataId  Data identifier
+        @return Bcakground model
+        """
+        dataRef = getDataRef(cache.butler, dataId)
+        exposure = self.processSingleBackground(dataRef)
+
+        # NAOJ prototype smoothed and then combined the entire image, but it shouldn't be any different
+        # to bin and combine the binned images except that there's fewer pixels to worry about.
+        config = FocalPlaneBackgroundConfig()
+        camera = dataRef.get("camera")
+        bgModel = FocalPlaneBackground.fromCamera(config, camera)
+        bgModel.addCcd(exposure)
+        return bgModel
+
+    def processSingleBackground(self, dataRef):
+        """!Process a single CCD for the background
+
+        This method is executed by the slaves.
+
+        Because we're interested in the background, we detect and mask astrophysical
+        sources, and pixels above the noise level.
+
+        @param dataRef  Data reference for CCD.
+        @return processed exposure
+        """
+        if not self.config.clobber and dataRef.datasetExists("postISRCCD"):
+            return dataRef.get("postISRCCD")
+        exposure = CalibTask.processSingle(self, dataRef)
+
+        # Detect sources. Requires us to remove the background; we'll restore it later.
+        bgTemp = self.subtractBackground.run(exposure).background
+        self.detection.detectFootprints(exposure, sigma=self.config.detectSigma)
+        image = exposure.getMaskedImage()
+
+        # Mask high pixels
+        variance = image.getVariance()
+        noise = np.sqrt(np.median(variance.getArray()))
+        isHigh = image.getImage().getArray() > self.config.maskThresh*noise
+        image.getMask().getArray()[isHigh] |= image.getMask().getPlaneBitMask("DETECTED")
+
+        # Restore the background: it's what we want!
+        image += bgTemp.getImage()
+
+        # Set detected/bad pixels to background to ensure they don't corrupt the background
+        maskVal = image.getMask().getPlaneBitMask(self.config.mask)
+        isBad = image.getMask().getArray() & maskVal > 0
+        bgLevel = np.median(image.getImage().getArray()[~isBad])
+        image.getImage().getArray()[isBad] = bgLevel
+        dataRef.put(exposure, "postISRCCD")
+        return exposure
+
+    def processSingle(self, dataRef, backgrounds, scales):
+        """Process a single CCD, specified by a data reference
+
+        We subtract the appropriate focal plane background model,
+        divide by the appropriate scale and measure the background.
+
+        Only slave nodes execute this method.
+
+        @param dataRef  Data reference for single CCD
+        @param backgrounds  Background model for each visit
+        @param scales  Scales for each visit
+        @return Processed exposure
+        """
+        visit = tuple(dataRef.dataId[key] for key in sorted(self.config.visitKeys))
+        exposure = dataRef.get("postISRCCD", immediate=True)
+        image = exposure.getMaskedImage()
+        detector = exposure.getDetector()
+        bbox = image.getBBox()
+
+        bgModel = backgrounds[visit]
+        bg = bgModel.toCcdBackground(detector, bbox)
+        image -= bg.getImage()
+        image /= scales[visit]
+
+        bg = self.sky.measureBackground(exposure.getMaskedImage())
+        dataRef.put(bg, "icExpBackground")
+        return exposure
+
+
+class PrimarySkyConfig(BaseSkyConfig):
+    def setDefaults(self):
+        self.sky.background.xBinSize = 64
+        self.sky.background.yBinSize = 64
+
+
+class PrimarySkyTask(BaseSkyTask):
+    """Primary sky frame construction
+
+    The primary sky frame is a (relatively) small-scale background
+    model, the response of the camera to the sky.
+
+    We might also construct secondary sky frames, which will be
+    larger-scale corrections.
+    """
+    ConfigClass = PrimarySkyConfig
+    _DefaultName = "sky"
+    calibName = "sky"
+
+    def combine(self, cache, struct):
+        """!Combine multiple background models of a particular CCD and write the output
+
+        Only the slave nodes execute this method.
+
+        @param cache  Process pool cache
+        @param struct  Parameters for the combination, which has the following components:
+            * ccdIdList   List of data identifiers for combination
+            * outputId    Data identifier for combined image (fully qualified for this CCD)
+        @return binned calib image
+        """
+        dataRefList = [getDataRef(cache.butler, dataId) if dataId is not None else None for
+                       dataId in struct.ccdIdList]
+        self.log.info("Combining %s on %s" % (struct.outputId, NODE))
+        bgList = [dataRef.get("icExpBackground", immediate=True).clone() for dataRef in dataRefList]
+
+        bgExp = self.sky.averageBackgrounds(bgList)
+
+        self.recordCalibInputs(cache.butler, bgExp, struct.ccdIdList, struct.outputId)
+        cache.butler.put(bgExp, "sky", struct.outputId)
+        return bgExp.getMaskedImage().getImage()
+
+
+class SecondarySkyConfig(BaseSkyConfig):
+    numComponents = Field(dtype=int, default=10, doc="Number of principal components")
+
+    def setDefaults(self):
+        self.sky.background.xBinSize = 512
+        self.sky.background.yBinSize = 1000
+
+
+class SecondarySkyTask(BaseSkyTask):
+    """Secondary sky frame construction
+
+    The secondary sky frame is a collection of large-scale background
+    models, the residuals after subtraction of the primary (small-scale)
+    sky frame.
+    """
+    ConfigClass = SecondarySkyConfig
+    _DefaultName = "sky2"
+    calibName = "sky2"
+
+    def scatterCombine(self, pool, outputId, ccdIdLists, scales):
+        """!Scatter the combination of exposures across multiple nodes
+
+        Only the master node executes this method.
+
+        We first measure the scales for the primary sky frame, apply
+        that and collect all the background models for principal
+        component analysis.  The principal components form the secondary
+        sky frame.
+
+        @param pool  Process pool
+        @param outputId  Output identifier (exposure part only)
+        @param ccdIdLists  Dict of data identifier lists for each CCD name
+        @param scales  Dict of structs with scales, for each CCD name
+        @return dict of binned images
+        """
+        self.log.info("Scatter collection")
+        numExps = set(len(expList) for expList in ccdIdLists.values())
+        assert len(numExps) == 1
+        numExps = numExps.pop()
+        numCcds = len(ccdIdLists)
+
+        visits = [set(tuple(ccdIdLists[ccdName][exp][key] for key in self.config.visitKeys) for
+                      ccdName in ccdIdLists) for exp in range(numExps)]
+        assert all(len(vv) == 1 for vv in visits)
+        visits = [vv.pop() for vv in visits]
+
+        measPrimary = mapToMatrix(pool, self.measurePrimary, ccdIdLists)
+        primaries = {visits[exp]: self.sky.solveScales([measPrimary[ccdName][exp]
+                                                      for ccdName in ccdIdLists])
+                     for exp in range(numExps)}
+        self.log.info("Primary scales: %s" % (primaries,))
+
+        # XXX possible improvement: iteratively combine frames rather than PCA
+        bgMatrix = mapToMatrix(pool, self.collectCombine, ccdIdLists, primaries)
+        boxes = [[bgMatrix[ccdName][exp].box for exp in range(numExps)] for ccdName in ccdIdLists]
+        dims = [set((boxes[ccd][exp].getWidth(), boxes[ccd][exp].getHeight()) for
+                     exp in range(numExps)) for ccd in range(numCcds)]
+        assert all(len(dd) == 1 for dd in dims)
+        arrayMatrix = [[bgMatrix[ccdName][exp].statsImage.getImage().getArray() for exp in range(numExps)] for
+                       ccdName in ccdIdLists]
+
+        shapes = [set(arrayMatrix[ccd][exp].shape for exp in range(numExps)) for ccd in range(numCcds)]
+        assert all(len(ss) == 1 for ss in shapes), "Differing shapes for CCD: %s" % (shapes,)
+        shapes = [ss.pop() for ss in shapes]
+        numPix = [ss[0]*ss[1] for ss in shapes]
+
+        # Join all CCDs within an exposure
+        exposures = [np.concatenate([arrayMatrix[ccd][exp].reshape((numPix[ccd], 1)) for
+                                        ccd in range(numCcds)], axis=0) for exp in range(numExps)]
+        data = np.concatenate(exposures, axis=1)
+
+        # Replace bad pixels with the mean
+        isBad = ~np.isfinite(data)
+        numPixels = np.ones_like(data, dtype=int)
+        numPixels[isBad] = 0
+        data[isBad] = 0.0
+        mean = np.sum(data, axis=1)/np.sum(numPixels, axis=1)
+        mean[~np.isfinite(mean)] = 0.0
+        for ii in range(numExps):
+            if isBad[ii].sum() > 0:
+                data[ii][isBad[ii]] = mean[isBad[ii]]
+
+        self.log.info("Performing PCA")
+        numComponents = min(numExps, self.config.numComponents)
+        components, evals, evecs = pca(data) # , numComponents)
+        self.log.info("Normalised eigenvalues: %s" % (evals/np.sum(evals),))
+
+        self.log.info("Performing robust PCA")
+        L, S = RPCA(data).fit()
+        rcomp, revals, revecs = pca(L) # , numComponents)
+        self.log.info("Normalised robust eigenvalues: %s" % (revals/np.sum(revals),))
+        components, evals, evecs = rcomp, revals, revecs
+
+        # Normalise each component: normalisation isn't important because we'll fit coefficients
+        for ii in range(numComponents):
+            norm = np.median(components.T[ii])
+            components.T[ii] /= norm
+
+        # Pull the CCDs out of the exposure array
+        offsets = [sum(numPix[:ccd]) for ccd in range(numCcds)]
+        componentsByCcd = [[components.T[comp][offsets[ccd]:offsets[ccd] + numPix[ccd]].reshape(shapes[ccd])
+                            for comp in range(numComponents)] for ccd in range(numCcds)]
+
+        writeData = [Struct(components=componentsByCcd[ccd],
+                            dims=dims[ccd].pop(),
+                            outputId=dict(outputId.items() + [(k, ccdName[i]) for
+                                          i, k in enumerate(self.config.ccdKeys)]),
+                            dataIdList=ccdIdLists[ccdName],
+                            ) for ccd, ccdName in enumerate(ccdIdLists)]
+        images = pool.map(self.writeComponents, writeData)
+        return dict(zip(ccdIdLists.keys(), images))
+
+    def measurePrimary(self, cache, dataId):
+        """Measure the scale for the primary sky frame
+
+        This method is executed on the slaves.
+
+        @param cache  Process pool cache
+        @param dataId  Data identifier for CCD
+        @return measured scale
+        """
+        exposure = cache.butler.get("postISRCCD", dataId, immediate=True)
+        sky = self.sky.getSkyData(cache.butler, dataId)
+        return self.sky.measureScale(exposure.getMaskedImage(), sky)
+
+    def collectCombine(self, cache, dataId, primaries):
+        """Collect background models for combination
+
+        We subtract the primary sky frame and measure the background.
+
+        This method is executed on the slaves.
+
+        @param cache  Process pool cache
+        @param dataId  Data identifier for CCD
+        @param primaries  Scale factors for primary sky frame
+        @return Struct(statsImage: binned image, box: image bounding box)
+        """
+        exposure = cache.butler.get("postISRCCD", dataId, immediate=True)
+        sky = self.sky.getSkyData(cache.butler, dataId)
+        visit = tuple(dataId[key] for key in self.config.visitKeys)
+        self.sky.subtractSkyFrame(exposure.getMaskedImage(), sky, primaries[visit])
+
+        bg = self.sky.measureBackground(exposure.getMaskedImage())
+        assert len(bg) == 1
+        return Struct(statsImage=bg[0][0].getStatsImage(), box=bg[0][0].getImageBBox())
+
+    def writeComponents(self, cache, struct):
+        """Write the secondary sky frame components for a CCD
+
+        This method is executed on the slaves.
+
+        @param cache  Process pool cache
+        @param struct  Struct(dataIdList: list of data identifiers,
+                              outputId: output data identifier,
+                              dims: dimensions of image)
+        @return First component image, for display purposes
+        """
+        width, height = struct.dims
+        box = afwGeom.Box2I(afwGeom.Point2I(0, 0), afwGeom.Extent2I(width, height))
+        calib = self.sky.componentsToImage(struct.components, box)
+        self.recordCalibInputs(cache.butler, calib, struct.dataIdList, struct.outputId)
+        cache.butler.put(calib, self.calibName, struct.outputId)
+        # Return the first only for display purposes
+        return afwMath.binImage(self.sky.imageToComponents(calib)[0].getImage(), self.config.binning)
