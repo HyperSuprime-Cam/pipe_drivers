@@ -19,6 +19,7 @@ import lsst.afw.image as afwImage
 import lsst.meas.algorithms as measAlg
 from lsst.pipe.tasks.repair import RepairTask
 from lsst.ip.isr import IsrTask
+from lsst.afw.cameraGeom.utils import makeImageFromCamera
 
 from lsst.ctrl.pool.parallel import BatchPoolTask
 from lsst.ctrl.pool.pool import Pool, NODE
@@ -332,6 +333,8 @@ class CalibConfig(Config):
                           doc="DataId keywords specifying a visit")
     calibKeys = ListField(dtype=str, default=[],
                           doc="DataId keywords specifying a calibration")
+    doCameraImage = Field(dtype=bool, default=True, doc="Create camera overview image?")
+    binning = Field(dtype=int, default=64, doc="Binning to apply for camera image")
 
     def setDefaults(self):
         self.isr.doWrite = False
@@ -437,6 +440,12 @@ class CalibTask(BatchPoolTask):
 
         # Scatter: combine
         calibs = self.scatterCombine(combinePool, outputId, ccdIdLists, scales)
+
+        if self.config.doCameraImage:
+            try:
+                self.makeCameraImage(butler, outputId, calibs)
+            except Exception as exc:
+                self.log.warn("Unable to create camera image: %s" % (exc,))
 
         return Struct(
             outputId = outputId,
@@ -610,6 +619,7 @@ class CalibTask(BatchPoolTask):
         @param outputId  Output identifier (exposure part only)
         @param ccdIdLists  Dict of data identifier lists for each CCD name
         @param scales  Dict of structs with scales, for each CCD name
+        @param dict of binned images
         """
         self.log.info("Scatter combination")
         outputIdItemList = outputId.items()
@@ -617,7 +627,8 @@ class CalibTask(BatchPoolTask):
                        outputId=dict(outputIdItemList +
                                      [(k, ccdName[i]) for i, k in enumerate(self.config.ccdKeys)])) for
                 ccdName in ccdIdLists]
-        pool.map(self.combine, data)
+        images = pool.map(self.combine, data)
+        return dict(zip(ccdIdLists.keys(), images))
 
     def combine(self, cache, struct):
         """!Combine multiple exposures of a particular CCD and write the output
@@ -630,6 +641,7 @@ class CalibTask(BatchPoolTask):
             * scales      Scales to apply (expScales are scalings for each exposure,
                                ccdScale is final scale for combined image)
             * outputId    Data identifier for combined image (fully qualified for this CCD)
+        @return binned calib image
         """
         dataRefList = [getDataRef(cache.butler, dataId) if dataId is not None else None for
                        dataId in struct.ccdIdList]
@@ -643,6 +655,8 @@ class CalibTask(BatchPoolTask):
         self.interpolateNans(calib)
 
         self.write(cache.butler, calib, struct.outputId)
+
+        return afwMath.binImage(calib.getImage(), self.config.binning)
 
     def recordCalibInputs(self, butler, calib, dataIdList, outputId):
         """!Record metadata including the inputs and creation details
@@ -698,6 +712,43 @@ class CalibTask(BatchPoolTask):
         """
         self.log.info("Writing %s on %s" % (dataId, NODE))
         butler.put(exposure, self.calibName, dataId)
+
+    def makeCameraImage(self, butler, dataId, calibs):
+        """!Create and write an image of the entire camera
+
+        This is useful for judging the quality or getting an overview of
+        the features of the calib.
+
+        This requires that the 'ccd name' is a tuple containing only the
+        detector ID.  If that is not the case, change CalibConfig.ccdKeys
+        or set CalibConfig.doCameraImage=False to disable this.
+
+        @param butler  Data butler
+        @param dataId  Data identifier for output
+        @param calibs  Dict mapping 'ccd name' to calib image
+        """
+        camera = butler.get("camera")
+
+        class ImageSource(object):
+            """Source of images for makeImageFromCamera
+
+            This assumes that the 'ccd name' is a tuple containing
+            only the detector ID.
+            """
+            def __init__(self, images):
+                self.isTrimmed = True
+                self.images = images
+                self.background = np.nan
+
+            def getCcdImage(self, detector, imageFactory, binSize):
+                detId = (detector.getId(),)
+                if detId not in self.images:
+                    return imageFactory(1, 1)
+                return self.images[detId]
+
+        image = makeImageFromCamera(camera, imageSource=ImageSource(calibs), imageFactory=afwImage.ImageF,
+                                    binSize=self.config.binning)
+        butler.put(image, self.calibName + "_camera", dataId)
 
 
 class BiasConfig(CalibConfig):
