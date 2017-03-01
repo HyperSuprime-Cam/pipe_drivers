@@ -238,6 +238,35 @@ def getCcdIdListFromExposures(expRefList, level="sensor", ccdKeys=["ccd"]):
     return ccdLists
 
 
+def mapToMatrix(pool, func, ccdIdLists, *args, **kwargs):
+    """Generate a matrix of results using pool.map
+
+    The function should have the call signature:
+        func(cache, dataId, *args, **kwargs)
+
+    We return a dict mapping 'ccd name' to a list of values for
+    each exposure.
+
+    @param pool  Process pool
+    @param func  Function to call for each dataId
+    @param ccdIdLists  Dict of data identifier lists for each CCD name
+    @return matrix of results
+    """
+    dataIdList = sum(ccdIdLists.values(), [])
+    resultList = pool.map(func, dataIdList, *args, **kwargs)
+    # Piece everything back together
+    data = dict((ccdName, [None] * len(expList)) for ccdName, expList in ccdIdLists.items())
+    indices = dict(sum([[(tuple(dataId.values()) if dataId is not None else None, (ccdName, expNum))
+                         for expNum, dataId in enumerate(expList)]
+                        for ccdName, expList in ccdIdLists.items()], []))
+    for dataId, result in zip(dataIdList, resultList):
+        if dataId is None:
+            continue
+        ccdName, expNum = indices[tuple(dataId.values())]
+        data[ccdName][expNum] = result
+    return data
+
+
 class CalibIdAction(argparse.Action):
     """Split name=value pairs and put the result in a dict"""
 
@@ -394,17 +423,28 @@ class CalibTask(BatchPoolTask):
                 raise RuntimeError(
                     "Unable to determine output filename from %s: %s" % (dataId, e))
 
-        pool = Pool()
-        pool.storeSet(butler=butler)
+        processPool = Pool("process")
+        processPool.storeSet(butler=butler)
 
         # Scatter: process CCDs independently
-        data = self.scatterProcess(pool, ccdIdLists)
+        data = self.scatterProcess(processPool, ccdIdLists)
 
         # Gather: determine scalings
         scales = self.scale(ccdIdLists, data)
 
+        combinePool = Pool("combine")
+        combinePool.storeSet(butler=butler)
+
         # Scatter: combine
-        self.scatterCombine(pool, outputId, ccdIdLists, scales)
+        calibs = self.scatterCombine(combinePool, outputId, ccdIdLists, scales)
+
+        return Struct(
+            outputId = outputId,
+            ccdIdLists = ccdIdLists,
+            scales = scales,
+            processPool = processPool,
+            combinePool = combinePool,
+            )
 
     def getOutputId(self, expRefList, calibId):
         """!Generate the data identifier for the output calib
@@ -467,26 +507,10 @@ class CalibTask(BatchPoolTask):
         @param ccdIdLists  Dict of data identifier lists for each CCD name
         @return Dict of lists of returned data for each CCD name
         """
-        dataIdList = sum(ccdIdLists.values(), [])
         self.log.info("Scatter processing")
+        return mapToMatrix(pool, self.process, ccdIdLists)
 
-        resultList = pool.map(self.process, dataIdList)
-
-        # Piece everything back together
-        data = dict((ccdName, [None] * len(expList))
-                    for ccdName, expList in ccdIdLists.items())
-        indices = dict(sum([[(tuple(dataId.values()) if dataId is not None else None, (ccdName, expNum))
-                             for expNum, dataId in enumerate(expList)]
-                            for ccdName, expList in ccdIdLists.items()], []))
-        for dataId, result in zip(dataIdList, resultList):
-            if dataId is None:
-                continue
-            ccdName, expNum = indices[tuple(dataId.values())]
-            data[ccdName][expNum] = result
-
-        return data
-
-    def process(self, cache, ccdId, outputName="postISRCCD"):
+    def process(self, cache, ccdId, outputName="postISRCCD", **kwargs):
         """!Process a CCD, specified by a data identifier
 
         After processing, optionally returns a result (produced by
@@ -509,7 +533,7 @@ class CalibTask(BatchPoolTask):
         if self.config.clobber or not sensorRef.datasetExists(outputName):
             self.log.info("Processing %s on %s" % (ccdId, NODE))
             try:
-                exposure = self.processSingle(sensorRef)
+                exposure = self.processSingle(sensorRef, **kwargs)
             except Exception as e:
                 self.log.warn("Unable to process %s: %s" % (ccdId, e))
                 raise
@@ -518,7 +542,7 @@ class CalibTask(BatchPoolTask):
         else:
             self.log.info(
                 "Using previously persisted processed exposure for %s" % (sensorRef.dataId,))
-            exposure = sensorRef.get(outputName, immediate=True)
+            exposure = sensorRef.get(outputName, immediate=False)
         return self.processResult(exposure)
 
     def processSingle(self, dataRef):
